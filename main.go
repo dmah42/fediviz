@@ -6,32 +6,40 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sync"
 )
 
 // Store the graph of fedi instances in an adjacency list.  Note some values may have large length, so we store indices here and a mapping elsewhere for the fedi domain.
 
+type Graph struct {
+	IdToDomain []string
+	Adjacency  map[int][]int
+	m          sync.RWMutex `json:"-"`
+}
+
 var (
-	id_to_domain = []string {
-		"hachyderm.io",
+	graph = Graph{
+		IdToDomain: []string{"hachyderm.io"},
+		Adjacency:  map[int][]int{},
 	}
-	domain_to_id = map[string]int {
+	domainToId = map[string]int{
 		"hachyderm.io": 0,
 	}
-	fedigraph = map[int][]int{
-	}
+	toVisit = []int{0}
+	toVisitSet = map[int]bool{0: true}
+	visited = map[int]bool{}
 )
 
 func main() {
-	visited := map[int]bool {}
-	to_visit := []int { 0 }
-
-	for len(to_visit) != 0 {
+	for len(toVisit) != 0 {
+		graph.m.RLock()
 		var next int
-		next, to_visit = pop(to_visit)
-		domain := id_to_domain[next]
+		next, toVisit = pop(toVisit)
+		domain := graph.IdToDomain[next]
+		graph.m.RUnlock()
 
 		// fetch the peer list
-		fmt.Printf("fetching peers for %q\n", domain)
+		fmt.Printf("fetching peers for %q (%d / %d)\n", domain, len(visited), len(toVisit))
 		url := fmt.Sprintf("https://%s/api/v1/instance/peers", domain)
 		res, err := http.Get(url)
 		if err != nil {
@@ -52,38 +60,50 @@ func main() {
 			fmt.Printf("failed to parse json response from %q: %s\n", domain, err)
 		}
 
+		graph.m.Lock()
 		for _, r := range results {
-			id, ok := domain_to_id[r]
+			id, ok := domainToId[r]
 			if !ok {
-				id_to_domain = append(id_to_domain, r)
-				domain_to_id[r] = len(id_to_domain) - 1
-				id = domain_to_id[r]
+				graph.IdToDomain = append(graph.IdToDomain, r)
+				domainToId[r] = len(graph.IdToDomain) - 1
+				id = domainToId[r]
 			}
 
 			// add to adjacency list
-			_, ok = fedigraph[next]
+			_, ok = graph.Adjacency[next]
 			if !ok {
-				fedigraph[next] = make([]int, 0)
+				graph.Adjacency[next] = make([]int, 0)
 			}
-			fedigraph[next] = append(fedigraph[next], id)
+			graph.Adjacency[next] = append(graph.Adjacency[next], id)
 
-			// if we haven't visited it, add it to the list to visit
-			_, ok = visited[id]; if !ok {
-				to_visit = append(to_visit, id)
+			// if we haven't visited it, and we don't plan to yet, add it to the list to visit
+			_, visitedOk := visited[id]
+			_, toVisitOk := toVisitSet[id]
+			if !visitedOk && !toVisitOk {
+				toVisit = append(toVisit, id)
+				toVisitSet[id] = true
 			}
 		}
 		visited[next] = true
+		graph.m.Unlock()
+		go dumpGraph()
 	}
-	f, err := json.MarshalIndent(fedigraph, "", "  ")
+}
+
+func dumpGraph() {
+	graph.m.RLock()
+	f, err := json.MarshalIndent(graph, "", "  ")
+	graph.m.RUnlock()
 	if err != nil {
 		fmt.Printf("failed to marshal fedigraph: %s", err)
 	}
-	err = os.WriteFile("fedigraph.json", f, 0644)
-	if err != nil {
+	if err = os.WriteFile("fedigraph.json", f, 0644); err != nil {
 		fmt.Printf("failed to write file: %s", err)
 	}
 }
 
 func pop(a []int) (int, []int) {
-	return a[len(a)-1],a[:len(a)-1]
+	popped, rest := a[len(a)-1], a[:len(a)-1]
+	delete(toVisitSet, popped)
+	return popped, rest
 }
